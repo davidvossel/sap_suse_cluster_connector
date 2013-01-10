@@ -33,7 +33,7 @@ my $nowstring;
 # init some environment 
 #
 
-my $cmd_crm = "crm";
+my $cmd_cibadmin = "cibadmin";
 my $cmd_crm_resource = "crm_resource";
 my $cmd_ptest = "ptest";
 my $logident = "sap_suse_cluster_connector";
@@ -43,7 +43,7 @@ my $logfacility = "LOG_USER";
 # open syslog
 #
 openlog($logident, $logoptions, $logfacility);
-my @all_cmds = ($cmd_crm, $cmd_crm_resource, $cmd_ptest);
+my @all_cmds = ($cmd_cibadmin, $cmd_crm_resource, $cmd_ptest);
 
 #	printf "ARGV: %s\n", join(" ", @ARGV);
 sub usage() {
@@ -126,16 +126,16 @@ sub fire_resource_action {
 	close SYSCONF;
 	if ( $act eq "stop" ) {
 		syslog("LOG_INFO", "fire_resource_action stop %s\n", $rsc);
-		if (system($cmd_crm,"resource",$act,$rsc)) { $rc=1; }
+		if (system($cmd_crm_resource,"-r",$rsc,"-m","-p","target-role","-v","Stopped")) { $rc=1; }
 	} elsif ( $act eq "start" ) {
 		syslog("LOG_INFO","fire_resource_action start %s\n", $rsc);
-		if (system($cmd_crm,"resource",$act,$rsc) ) { $rc=1; }
+		if (system($cmd_crm_resource,"-r",$rsc,"-m","-d","target-role") ) { $rc=1; }
 	} elsif ( $act eq "migrate" ) {
 		syslog("LOG_INFO","fire_resource_action migrate %s %s\n", $rsc, $nod);
 		if ( defined $nod ) {
-			if (system($cmd_crm,"resource",$act,$rsc,$nod) ) { $rc=1; }
+			if (system($cmd_crm_resource,"-r",$rsc,"-M","-N",$nod) ) { $rc=1; }
 		}
-	} 
+	}
 	syslog("LOG_INFO"," rc=%i\n", $rc);
 	return $rc;
 }
@@ -212,7 +212,7 @@ sub check_pending_action {
 	return $rc;
 }
 
-sub list_sap_resources {  
+sub list_sap_resources {
 	#
 	# --out file --sid sid --ino ino
 	#
@@ -244,79 +244,83 @@ sub list_sap_resources {
 	#printf "ARGV: %s", join(" ", @ARGV);
 
 	my ($fclass, $fprovider, $fra, $fname, $fgname) = ("","","","","");
-	my $found = 0;     # found a primitive matching criteria
 	my $foundRes = 0; # found correct Resource
 
-	open CRMOUT, "$cmd_crm configure show 2>/dev/null |" || die "could not open crm output";
-	my $line;
-	while (defined($line = <CRMOUT>) ) {
-		#
-		# to handle line continuation ...
-		chomp $line;
-		if ($line =~ s/\\$//) {
-			$line .= <CRMOUT>;
-			redo unless eof(CRMOUT);
+	open CRMOUT, "$cmd_cibadmin --local -Q --xpath '//primitive[\@type=\"$sra\"]' --node-path 2>/dev/null |" || die "could not open cibadmin output";
+	while (<CRMOUT>) {
+		my $line = $_;
+		if ($line =~ /primitive..id='([a-zA-Z0-9_]+)'/) {
+			($fname) = ($1);
+		} else {
+			next;
 		}
-		chomp $line;
-                #syslog ("LOG_DEBUG", "%s\n", $line);
-		#
-		# handle primitive records
-		#
-		if ( ($foundRes==0) && ( $line =~ /^primitive ([a-zA-Z0-9_]+) ([a-zA-Z0-9_]+):([a-zA-Z0-9_]+):([a-zA-Z0-9_]+)/ )) {
-			#
-			# 1. found begin of primitive definition and we did not already found the resource
-			#   -> catch resource-name, resource-class, resource-provider, resource-agent
-			#
-			($fclass, $fprovider, $fra, $fname) = ($2, $3, $4, $1);
-			if (( $fclass eq $sclass ) && ( $fprovider eq $sprovider ) && ( $fra eq $sra ) ) {
-				#
-				# 2. we have found a primitive of the correct type, lets look at the (ERS_)InstanceName
-				#
-				#syslog("LOG_DEBUG","rsc: %s\n", $line);
-				$found = 1;
-				my $searchInst = "${sid}_[a-zA-Z0-9]+${ino}_[a-zA-Z0-9_-]+";
-				if (  $line =~ /(ERS_)?InstanceName="($searchInst)"/ ) {
-                                        my $isERS=$1;
-					my $finstance=$2;
-					syslog("LOG_DEBUG","Resource %s with %sInstanceName=%s found\n", $fname, $isERS, $finstance);
-					if (  $line =~ /is-managed="false"/ )  {
-						syslog("LOG_DEBUG","Resource %s is unmanged - ignore for sapstartsrv lsr call", $fname, $searchInst);
-						$foundRes=0;
-					} else {
+
+		if ( $line =~ /[group|master|clone]..id='([a-zA-Z0-9_]+)'/) {
+			($fgname) = ($1);
+		}
+
+		if ($foundRes==0) {
+			open RESOURCE1_OUT, "$cmd_cibadmin -Q --xpath \"//primitive[\@id='$fname']//nvpair[\@name='$sparam']\"  2>/dev/null |" || die "could not open cibadmin output";
+			while (<RESOURCE1_OUT>) {
+				my $result = $_;
+				if ($result =~ /value="([a-zA-Z0-9_]+)"/) {
+					my $finstance=$1;
+					if ( $1 =~ /^${sid}_[a-zA-Z0-9]+${ino}_[a-zA-Z0-9_-]+$/ ) {
 						$foundRes=1;
+					    syslog("LOG_DEBUG","Resource %s with %s=%s found\n", $fname, $sparam, $finstance);
 					}
 				}
-			} else {
-				$found = 0;
-			}
-	        } elsif ( ($foundRes==1) && ( $line =~ /^(group|ms) ([a-zA-Z0-9_]+).*($fname)/ )) {
-			# 
-			# found resource is member of a group
-			#
-			my $ftype=$1;
-			$fgname = $2;
-			if (  $line =~ /is-managed="false"/ )  {
-				syslog("LOG_DEBUG", "%s %s with primitive %s is unmanged - ignore for sapstartsrv lsr call", $ftype, $fgname, $fname);
-				$foundRes=0;
 			}
 		}
-	}	
+
+		if ($foundRes==0) {
+			open RESOURCE2_OUT, "$cmd_cibadmin -Q --xpath \"//primitive[\@id='$fname']//nvpair[\@name='$sparam2']\"  2>/dev/null |" || die "could not open cibadmin output";
+			while (<RESOURCE2_OUT>) {
+				my $result = $_;
+				if ($result =~ /value="([a-zA-Z0-9_]+)"/) {
+					my $finstance=$1;
+					if ( $1 =~ /^${sid}_[a-zA-Z0-9]+${ino}_[a-zA-Z0-9_-]+$/ ) {
+						$foundRes=1;
+					    syslog("LOG_DEBUG","Resource %s with %s=%s found\n", $fname, $sparam2, $finstance);
+					}
+				}
+			}
+		}
+
+		# check to make sure the resource is managed
+		if ($foundRes==1) {
+			open MANAGED_OUT, "$cmd_cibadmin -Q --xpath \"//primitive[\@id='$fname']//nvpair[\@name='is-managed'][\@value='false']\"  2>/dev/null |" || die "could not open cibadmin output";
+			while (<MANAGED_OUT>) {
+				my $result = $_;
+				if ($result =~ /value="false"/) {
+					syslog("LOG_DEBUG","Resource %s is unmanged - ignore for sapstartsrv lsr call", $fname);
+					$foundRes=0;
+				}
+			}
+		}
+
+		if ($foundRes == 1) {
+			last;
+		}
+	}
 
 	if ($foundRes==1) {
 		if ($out eq "") {
 			printf "%s:%s:%s\n", $fname, $fgname, "-";
 			$rc=1;
 		} else {
-			open OUT, ">" . $out;
+			unless (open(OUT, '>',$out)) {
+				print STDERR "Can't open $out: $!\n";
+			}
 			syslog("LOG_INFO","lsr result: %s:%s:%s:%s:%s\n", $sid, $ino, $fname, $fgname, "-");
 			printf OUT "%s:%s:%s:%s:%s\n", $sid, $ino, $fname, $fgname, "-";
 			close OUT;
 			$rc=0;
 		}
 	} else {
-			syslog("LOG_INFO","lsr result: empty\n");
-			$rc=1;
-        }
+		syslog("LOG_INFO","lsr result: empty\n");
+		$rc=1;
+	}
 
 	# TODO: scores and node names sorted by scores -> use ptest
 	#
@@ -325,7 +329,7 @@ sub list_sap_resources {
 	#group_color: rsc_SAPInstance_NA0_ASCS00_sapna0as allocation score on ls3199: 0
 	#native_color: rsc_SAPInstance_NA0_ASCS00_sapna0as allocation score on ls3199: -INFINITY
 	return $rc;
-} 
+}
 
 sub list_sap_nodes { 
 	#
